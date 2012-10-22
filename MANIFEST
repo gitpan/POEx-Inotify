@@ -1,0 +1,11 @@
+Changes
+MANIFEST
+Makefile.PL
+README
+lib/POEx/Inotify.pm
+t/00_syntax.t
+t/01_pod.t
+t/02_pod_coverage.t
+t/10_simple.t
+t/20_multiple.t
+t/21_unmonitor.t
