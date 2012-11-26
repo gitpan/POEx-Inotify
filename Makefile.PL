@@ -16,6 +16,7 @@ WriteMakefile(
     LICENSE           => 'perl',
     PREREQ_PM         => {
             'POE'       => 1.284,
+            'POE::Session::PlainCall'       => 0.0300,
             'Linux::Inotify2' => 1,
         },
     ($] >= 5.005 ?     ## Add these new keywords supported since 5.005

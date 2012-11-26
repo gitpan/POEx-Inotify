@@ -3,6 +3,7 @@ MANIFEST
 Makefile.PL
 README
 lib/POEx/Inotify.pm
+t/00_info.t
 t/00_syntax.t
 t/01_pod.t
 t/02_pod_coverage.t

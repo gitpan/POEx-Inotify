@@ -102,7 +102,7 @@ sub start
     DEBUG and diag( $self->{file1} );
 
     poe->kernel->call( $self->{notify}, unmonitor => { path=>$self->{dir}, 
-                                                       mask => IN_CLOSE } );
+                                                       event => 'notify_create' } );
 
     delete $self->{delay};
     my $fh = IO::File->new( ">$self->{file1}" );

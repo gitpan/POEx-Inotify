@@ -6,7 +6,7 @@ use 5.008008;
 use strict;
 use warnings;
 
-our $VERSION = '0.0100';
+our $VERSION = '0.0101';
 $VERSION = eval $VERSION;  # see L<perlmodstyle>
 
 use POE;
@@ -245,7 +245,7 @@ sub unmonitor
     my( $self, $args ) = @_;
     my $path = $args->{path};
     $args->{mask} = 0xFFFFFFFF unless defined $args->{mask};
-    my $session = poe->sender;
+    $args->{session} = poe->sender;
     my $caller = join ' ', at => poe->caller_file,
                                line => poe->caller_line;
     my $notify = $self->_find_path( $path );
@@ -253,13 +253,11 @@ sub unmonitor
         warn "$path wasn't monitored $caller\n";
         return;
     }
-
     my $changed = 0;
     my @calls;
     foreach my $call ( @{ $notify->{call} } ) {
-        if( $self->{force} or ( $call->{cb}[0] eq $session 
-                                    and $call->{mask} == $args->{mask} ) ) {
-            poe->kernel->refcount_decrement( $session, "NOTIFY $path" );
+        if( $self->_call_match( $call, $args ) ) {
+            poe->kernel->refcount_decrement( $args->{session}, "NOTIFY $path" );
             $changed = 1;
         }
         else {
@@ -283,6 +281,19 @@ sub unmonitor
     }
     return;
 }
+
+sub _call_match
+{
+    my( $self, $call, $args ) = @_;
+    return 1 if $self->{force};
+    return unless $call->{cb}[0] eq $args->{session};
+#    return unless $call->{mask} == $args->{mask};
+    return 1 unless $args->{event};
+    return 1 if $args->{event} eq '*';
+    return 1 if $call->{cb}[1] eq $args->{event};
+    return;
+}
+
 
 sub _notify_mask
 {
@@ -486,7 +497,7 @@ The name of the event handler in the current session to post changes back
 to.  Mandatory.
 
 The event handler will receive an L<Linux::Inotify2::Event> as its first argument.  Other
-arguments are the L</args>.
+arguments are those specified by L</args>.
 
 =item args
 
@@ -527,7 +538,12 @@ Accepts one argument, a hashref containing the following keys:
 
 =item path
 
-The filesystem path to the directory to be unmonitored.  Mandatory.
+The filesystem path to the directory to to stop monitoring.  Mandatory.
+
+=item event
+
+Name of the monitor event that was used in the original L</monitor> call.  Mandatory.
+You may use C<*> to unmonitor all events for the current session.
 
 =back
 
@@ -535,10 +551,8 @@ The filesystem path to the directory to be unmonitored.  Mandatory.
 
 Multiple sessions may monitor the same path at the same time.  A single
 session may monitor multiple paths.  However, if a single session is
-monitoring the same path multiple times, care must be taken when
-unmonitoring.  For instance, if you have one monitor on C<IN_ALL_EVENTS> and
-another on C<IN_DELETE>, then unmonitoring C<IN_DELETE> will prevent any
-C<IN_DELETE> event from getting to the first monitor.
+monitoring the same path multiple times it must use different events
+to distinguish them.
 
 
 =head2 shutdown
