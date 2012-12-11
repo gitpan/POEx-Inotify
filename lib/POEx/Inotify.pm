@@ -6,16 +6,19 @@ use 5.008008;
 use strict;
 use warnings;
 
-our $VERSION = '0.0101';
+our $VERSION = '0.0200';
 $VERSION = eval $VERSION;  # see L<perlmodstyle>
 
 use POE;
 use POE::Session::PlainCall;
 use Storable qw( dclone );
+use Carp;
+use Data::Dump qw( pp );
 
 use Linux::Inotify2;
 
 sub DEBUG () { 0 }
+sub DEBUG2 () { 0 }
 
 #############################################
 sub spawn
@@ -32,6 +35,8 @@ sub spawn
                     states    => [ qw( _start _stop shutdown
                                        poll inotify
                                        monitor unmonitor
+                                       __pending_deleted __pending_created
+                                       __self_deleted
                                  ) ]
                 );
 }
@@ -80,6 +85,8 @@ sub shutdown
     poe->kernel->select_read( $self->{fh} ) if $self->{fh};
     poe->kernel->alias_remove( $self->{alias} );
     delete $self->{fh};
+#    delete $self->{inotify};
+    return;
 }
 
 #############################################
@@ -125,18 +132,20 @@ sub inotify
     next unless $notify;
 
     foreach my $e ( @$E ) {
-        DEBUG and warn "$self->{alias}: inotify ", $e->fullname;
-        foreach my $call ( @{ $notify->{call} } ) {
-            DEBUG and do {
-                warn sprintf "$self->{alias}: %08x vs %08x", $e->mask, $call->{tmask};
+        DEBUG and do {
+                warn "$self->{alias}: inotify ", $e->fullname;
                 foreach my $flag ( qw( ACCESS MODIFY ATTRIB CLOSE_WRITE CLOSE_NOWRITE 
                        OPEN MOVED_FROM MOVED_TO CREATE DELETE DELETE_SELF
-                       MOVE_SELF ALL_EVENTS ONESHOT ONLYDIR DONT_FOLLOW
+                       MOVE_SELF ONESHOT ONLYDIR DONT_FOLLOW
                        MASK_ADD CLOSE MOVE ) ) {
                     my $method = "IN_$flag";
-                    warn "$self->{alias}: $flag" if $e->$method();
+                    warn "$self->{alias}: IN_$flag" if $e->$method();
                 }
-            };
+            };        
+
+        foreach my $call ( @{ $notify->{call} } ) {
+            DEBUG and 
+                warn sprintf "$self->{alias}: %08x vs %08x", $e->mask, $call->{tmask};
             
             next unless $e->mask & $call->{tmask};
 
@@ -155,17 +164,54 @@ sub _find_path
 }
 
 
-sub _build_call
+sub _build_calls
 {
     my( $self, $args ) = @_;
-    my $event = $args->{event};
-    return "No event specified" unless $event;
 
-    my $A     = $args->{args};
-    my $session = poe->sender;
+    unless( $args->{events} ) {
+        return "No event specified" unless $args->{event};
+        my $event = delete $args->{event};
+        my $mask  = delete $args->{mask};
+        my $A     = delete $args->{args};
 
-    my $call = [ $session, $event, undef ];
-    if( $A ) {
+        $mask = IN_ALL_EVENTS unless defined $mask;
+        $args->{events} = { $mask => { event=>$event, 
+                                       args => $A
+                                     } };
+    }
+
+    my $total_mask = 0;
+    my @calls;
+
+    foreach my $mask ( keys %{ $args->{events} } ) {
+        $total_mask |= 0+$mask;
+
+        my $E = $args->{events}{ $mask };
+
+        my( $event, $A );
+        my $r = ref $E;
+        unless( $r ) {              # { MASK => 'event' }
+            $event = $E;
+            $A = [];
+        }
+        elsif( 'ARRAY' eq $r ) {    # { MASK => ['event', @ARGS }
+            $event = shift @$E;
+            $A = $E;
+        }
+        else {                      # { MASK => { event=>'event', args=>[] }
+            $event = $E->{event};
+            $A = $E->{args}||$args->{args};
+        }
+                                        # undef is place holder for the change object
+        my $call = [ $args->{session}, $event, undef ];
+
+        push @calls, { cb   => $call,   # list of callbacks
+                       mask => $mask,                   # user specified mask
+                      tmask => $self->_const2mask( $mask, $args ),      # true mask
+                       mode => $args->{mode}            # mode we want for this
+                     };
+        next unless $A;
+
         $A = dclone $A if ref $A;
         if( 'ARRAY' eq ref $A ) {
             push @$call, @$A;
@@ -174,17 +220,14 @@ sub _build_call
             push @$call, $A;
         }
     }
+    return "No event specified" unless @calls;
 
-    return { cb   => $call, 
-             mask => $args->{mask},                     # user specified mask
-             tmask => $self->_const2mask( $args ),      # true mask
-           };
+    return $total_mask, @calls;
 }
 
 sub _const2mask
 {
-    my( $self, $args ) = @_;
-    my $mask = $args->{mask}; 
+    my( $self, $mask, $args ) = @_;
     if( -f $args->{path} and $mask | IN_DELETE ) {
         $mask |= IN_DELETE_SELF;    # IN_DELETE is useless on a file
     }
@@ -196,101 +239,188 @@ sub monitor
 {
     my( $self, $args ) = @_;
     return if $self->{shutdown};
+    $args->{session} = poe->sender;
 
-    my $path = $args->{path};
+    my $mode = $args->{mode} ||= 'cooked';
+
     my $caller = join ' ', at => poe->caller_file,
-                               line => poe->caller_line;
-    $args->{mask} = IN_ALL_EVENTS unless defined $args->{mask};
+                               line => poe->caller_line . "\n";
 
-    my $notify = $self->_find_path( $path );
-    my $in_mask = $args->{mask};
-    if( $notify ) {
-        $in_mask |= $notify->{mask};
-    }
+    my( $new_mask, @calls ) = $self->_build_calls( $args );
+    die "Nothing to do: $new_mask $caller" unless @calls;
 
-    my $watch = $self->add_inotify( $path, $in_mask );
-
-    my $call = $self->_build_call( $args, $watch );
-    die "Unable to build call: $call $caller" unless ref $call;
-
-    if( $notify ) {
-        DEBUG and warn "$self->{alias}: monitor $path again";
-        push @{ $notify->{call} }, $call;
-        $notify->{watch} = $watch;
-    }
-    else {
-        DEBUG and warn "$self->{alias}: monitor $path";
-
-        unless( $watch ) {
-            die "Unable to watch $path: $! $caller";
-        }
-
-        $notify = {
-                    path => $path,
-                    call => [ $call ],
-                    mask => $args->{mask},
-                    watch => $watch
-                };
-        $self->{path}{$path} = $notify;
-        poe->kernel->refcount_increment( poe->session->ID, "NOTIFY $path" );
-    }
-
-    poe->kernel->refcount_increment( poe->sender, "NOTIFY $path" );
-
-    return;
+    return $self->_monitor_add( $args->{path}, $mode, \@calls, $caller );
 }
 
+#############################################
+sub _monitor_add 
+{
+    my( $self, $path, $mode, $calls, $caller ) = @_;
+    confess "Why no calls? calls=", pp $calls unless $calls and 'ARRAY' eq ref $calls;
+    $caller ||= '';
+    if( !-e $path ) {
+        return if $mode =~ /^_/;
+        if( $mode eq 'cooked' ) {
+            $self->_pending( $path, $calls );
+            return;
+        }
+    }
+
+    my $notify = $self->_find_path( $path );
+
+    # save the new calls
+    if( $notify ) {
+        DEBUG and 
+            warn "$self->{alias}: monitor $path again for $mode ($notify) $caller";
+        push @{ $notify->{call} }, @$calls;
+    }
+    else {
+        $notify = {
+                    path => $path,
+                    call => [ @$calls ],
+                    mask => 0,
+                    # watch => 
+                };
+        DEBUG and 
+            warn "$self->{alias}: monitor $path for $mode ($notify) $caller";
+        $self->{path}{$path} = $notify;
+        DEBUG2 and warn "$self->{alias}: REFCNT PLUS  ", poe->session->ID, " (me) $path";
+        poe->kernel->refcount_increment( poe->session->ID, "NOTIFY $path" );
+
+        $self->_self_monitor( $path ) unless $mode eq 'raw'
+                                            or $mode =~ /^_/;
+    }
+
+    $notify->{new_mask} = $self->_notify_mask( $notify );
+
+    $notify->{watch} = $self->add_inotify( $path, $notify->{new_mask} );
+    die "Unable to watch $path: $! $caller" unless $notify->{watch};
+
+    # And increment the sender's refcnt
+    foreach my $call ( @$calls ) {
+        use Carp;
+        use Data::Dump qw( pp );
+        confess pp $calls if 'ARRAY' eq ref $call;
+        DEBUG2 and warn "$self->{alias}: REFCNT PLUS  ", $call->{cb}[0], " ($call->{mode}) $path";
+        DEBUG2 and $call->{mode} eq 'self' and warn "$self->{alias}: REFCNT $caller";
+        poe->kernel->refcount_increment( $call->{cb}[0], "NOTIFY $path" );
+    }
+    return 1;
+}
+
+
+#############################################
 sub unmonitor
 {
     my( $self, $args ) = @_;
     my $path = $args->{path};
-    $args->{mask} = 0xFFFFFFFF unless defined $args->{mask};
     $args->{session} = poe->sender;
+    $args->{mask} = 0xFFFFFFFF unless defined $args->{mask};
     my $caller = join ' ', at => poe->caller_file,
                                line => poe->caller_line;
+
+    my $once = 0;
     my $notify = $self->_find_path( $path );
-    unless( $notify ) {
-        warn "$path wasn't monitored $caller\n";
-        return;
+    if( $notify ) {
+        $self->_unmonitor_remove( $path, $notify, $args, $caller );
+        $once++;
     }
-    my $changed = 0;
-    my @calls;
+    
+    my $P = $self->_find_pending( $path );
+    if( $P ) {
+        $self->_pending_remove( $path, $P, $args, $caller );
+        $once++;
+    }
+
+    unless( $once ) {
+        warn "$self->{alias}: $path wasn't monitored $caller\n";
+    }
+    return $once;
+}
+
+sub _unmonitor_remove
+{
+    my( $self, $path, $notify, $args, $caller ) = @_;
+
+    # Go through the calls, dropping those the sender wants us to drop
+    my $ours = 0;
+    my( @calls, @dec );
     foreach my $call ( @{ $notify->{call} } ) {
         if( $self->_call_match( $call, $args ) ) {
-            poe->kernel->refcount_decrement( $args->{session}, "NOTIFY $path" );
-            $changed = 1;
+            push @dec, $call;
         }
         else {
+            $ours++ if $call->{cb}[0] == poe->session->ID;
             push @calls, $call;
         }
     }
-    $notify->{call} = \@calls;
-    if( @calls ) {
-        if( $changed ) {
+
+    my $finished = 0;
+    if( @calls > $ours ) {
+        # If we have any non-internal calls, we keep the notify
+        DEBUG and 
+            warn "$self->{alias}: still monitor $path ($notify)";
+        $notify->{call} = \@calls;
+        if( @dec ) {
+            # If we found a CB to remove, that means the mask might have changed
             $notify->{mask} = $self->_notify_mask( $notify );
             $self->add_inotify( $path, $notify->{mask} );
         }
-        
-        DEBUG and warn "$path still being monitored\n";
     }
     else {
-        DEBUG and warn "$self->{alias}: unmonitor $path";
+        # No external calls so we can drop this notify
+        DEBUG and 
+            warn "$self->{alias}: unmonitor $path ($notify)";
         $notify->{watch}->cancel; 
+        delete $notify->{watch};
+        DEBUG2 and warn "$self->{alias}: REFCNT MINUS ", poe->session->ID, " (me) $path";
         poe->kernel->refcount_decrement( poe->session->ID, "NOTIFY $path" );
         delete $self->{path}{ $path };
+        $self->_self_unmonitor( $path );
+        push @dec, @calls;
+        $finished = 1;
     }
-    return;
+
+    # Now clear the refcnt for the sender
+    foreach my $call ( @dec ) {
+        DEBUG2 and warn "$self->{alias}: REFCNT MINUS ", $call->{cb}[0], " ($call->{mode}) $path";
+        poe->kernel->refcount_decrement( $call->{cb}[0], "NOTIFY $path" );
+    }
+    return $finished;
 }
 
 sub _call_match
 {
     my( $self, $call, $args ) = @_;
     return 1 if $self->{force};
-    return unless $call->{cb}[0] eq $args->{session};
-#    return unless $call->{mask} == $args->{mask};
-    return 1 unless $args->{event};
-    return 1 if $args->{event} eq '*';
-    return 1 if $call->{cb}[1] eq $args->{event};
+    return unless $call->{cb}[0] == $args->{session};
+    my @E;
+    
+    # Which event do we want to unmonitor
+    if( $args->{event} ) {          # event => 'event'
+        @E = ( $args->{event} );
+    }
+    elsif( $args->{events} ) {
+        my $r = ref $args->{events};
+        if( 'ARRAY' eq ref $r ) {   # events => [ ... ]
+            @E = @{ $args->{event} };
+        }
+        elsif( 'HASH' eq $r ) {     # events => { mask => 'event' }
+            while( my( $mask, $event ) = each %{ $args->{event} } ) {
+                next unless $call->{mask} & $mask;
+                push @E, $event;
+            }
+            return 0 unless @E;     # no mask matched
+        }
+    }
+    return 1 unless @E;             # all of them for this session?
+
+    # only some of them
+    foreach my $event ( @E ) {
+        return 1 if $event eq '*';
+        return 1 if $event eq $call->{cb}[1];
+    }
+        
     return;
 }
 
@@ -300,9 +430,261 @@ sub _notify_mask
     my( $self, $notify ) = @_;
     my $mask = 0;
     foreach my $call ( @{ $notify->{call} } ) {
+        confess pp $notify if 'ARRAY' eq ref $call;
         $mask |= $call->{mask};
     }
     return $mask;
+}
+
+
+
+
+#####################################################################
+sub _pending
+{
+    my( $self, $path, $calls ) = @_;
+
+    my $P = $self->_find_pending( $path );
+    if( $P and $P->{monitored} ) {
+        DEBUG and warn "$self->{alias}: pending $path more";
+        push @{ $P->{call} }, @$calls if $calls;
+        return;
+    }
+
+    my @todo = File::Spec->splitdir( $path );
+    while( @todo > 1 ) {
+        my $want = pop @todo;
+        my $maybe = File::Spec->catdir( @todo );
+        if( -e $maybe ) {
+            if( $self->_pending_monitor( $path, $maybe, $want ) ) {
+                DEBUG and warn "$self->{alias}: want $want in $maybe";
+                my $P = $self->_find_pending( $path );
+                $P->{monitored} = 1;
+                push @{ $P->{call} }, @$calls if $calls;
+                return;
+            }
+        }
+    }
+    $self->_pending_monitor( $path, File::Spec->rootdir, @todo, $calls );
+}
+
+#############################################
+sub _pending_remove
+{
+    my( $self, $path, $P, $args, $caller ) = @_;
+
+    my( @calls, @dec );
+    foreach my $call ( @{ $P->{call} } ) {
+        next if $self->_call_match( $call, $args );
+        push @calls, $call;
+    }
+
+    my $finished = 0;
+    if( @calls ) {
+        DEBUG and 
+            warn "$self->{alias}: still pending $path ($P)";
+        $P->{call} = \@calls;
+    }
+    else {
+        # No external calls so we can drop this notify
+        DEBUG and 
+            warn "$self->{alias}: unpending $path ($P)";
+        $self->_pending_unmonitor( $path, $P->{exists} );
+        delete $self->{pending}{ $path };
+        $finished = 1;
+    }
+
+    return $finished;
+}
+
+#############################################
+sub _pending_monitor
+{
+    my( $self, $path, $exists, $want ) = @_;
+    DEBUG and warn "$self->{alias}: pending $path pending on $exists";
+
+    $self->{pending}{ $path } ||= { call=>[], exists=>$exists };
+
+    my $M = { path => $exists,
+              mode => '_pending',
+              events => {
+                    (IN_DELETE_SELF|IN_MOVE_SELF) => 
+                                    [ '__pending_deleted', $path, $exists ],
+                    (IN_MOVED_TO|IN_CREATE|IN_CLOSE_WRITE) => 
+                                    [ '__pending_created', $path, $exists, $want ]
+                }
+            };
+    # this has to be a call bacause ->monitor calls poe->sender
+    return poe->kernel->call( $self->{alias}, 'monitor', $M );
+}
+
+
+sub _pending_unmonitor
+{
+    my( $self, $path, $exists ) = @_;
+
+    my $P = $self->_find_pending( $path );
+    return unless $P and $P->{monitored};
+    poe->kernel->call( $self->{alias}, 'unmonitor', 
+                            {   path=>$exists,  
+                                events => [ qw( __pending_deleted __pending_created ) ]
+                            } );
+    $P->{monitored} = 0;
+}
+
+#############################################
+sub _find_pending
+{
+    my( $self, $path ) = @_;
+    return $self->{pending}{ $path };
+}
+
+#############################################
+sub __pending_deleted
+{
+    my( $self, $ch, $path, $exists ) = @_;
+
+    my $P = $self->_find_pending( $path );
+    return unless $P;
+
+    DEBUG and warn "$self->{alias}: pending $path deleted $exists";
+    $self->_pending_unmonitor( $path, $exists );
+    $self->_pending( $path );
+}
+
+#############################################
+sub __pending_created
+{
+    my( $self, $ch, $path, $exists, $want ) = @_;
+    return unless $ch->name eq $want;
+
+    my $P = $self->_find_pending( $path );
+    return unless $P;
+
+    DEBUG and warn "$self->{alias}: pending $path created ", $ch->name;
+    $self->_pending_unmonitor( $path, $exists );
+    if( -e $path ) {
+        delete $self->{pending}{ $path };
+        $self->_monitor_add( $path, 'cooked', $P->{call} );
+        $self->_fake_created( $path );
+    }
+    else {
+        $self->_pending( $path );
+    }
+}
+
+
+#####################################################################
+sub _self_monitor
+{
+    my( $self, $path ) = @_;
+    my $S = $self->_find_self( $path );
+    if( $S and $S->{monitored} ) {
+        DEBUG and warn "$self->{alias}: check $path more";
+        return;
+    }
+
+    $S = $self->{self}{ $path } = {};
+
+    my $M = {   path => $path,
+                mask => (IN_MOVE_SELF|IN_DELETE_SELF),
+                event => '__self_deleted',
+                mode => '_self',
+                args => [ $path ]
+            };
+
+    $S->{monitored} = poe->kernel->call( $self->{alias} => 'monitor', $M );
+    return 1 if $S->{monitored};
+    warn "$self->{alias}: Monitoring $path failed";
+    delete $self->{self}{ $path };
+    return;
+}
+
+#############################################
+sub _self_remove
+{
+    my( $self, $path, $S, $args, $caller ) = @_;
+
+    my( @calls, @dec );
+    foreach my $call ( @{ $S->{call} } ) {
+        next if $self->_call_match( $call, $args );
+        push @calls, $call;
+    }
+
+    my $finished = 0;
+    if( @calls ) {
+        DEBUG and 
+            warn "$self->{alias}: still self $path";
+        $S->{call} = \@calls;
+    }
+    else {
+        DEBUG and 
+            warn "$self->{alias}: unself $path";
+        $self->_self_unmonitor( $path );
+        $finished = 1;
+    }
+
+    return $finished;
+}
+
+    
+#############################################
+sub _self_unmonitor
+{
+    my( $self, $path ) = @_;
+    delete $self->{self}{ $path };
+    # we are called from ->unmonitor which has already cleared {path}
+    # and the Inotify2 object, so we don't have to do anything more
+}
+
+#############################################
+sub __self_deleted
+{
+    my( $self, $ch, $path ) = @_;
+    DEBUG and warn "$self->{alias}: check $path deleted";
+
+    return if $self->{shutdown};
+
+    my $P = $self->_find_path( $path );
+
+    local $self->{force} = 1;   # delete everything for this path.  It no longer exists!
+    $self->unmonitor( { path=>$path } );
+
+    my @keep;
+    my $changed;
+    foreach my $call ( @{ $P->{call} } ) {
+        if( $call->{mode} eq 'cooked' ) {
+            push @keep, $call;
+        }
+        else {
+            $changed = 1;
+        }
+    }
+    if( @keep ) {
+        $self->_pending( $path, \@keep );
+    }
+}
+
+#############################################
+sub _find_self
+{
+    my( $self, $path ) = @_;
+    return $self->{self}{ $path };
+}
+
+
+#####################################################################
+sub _fake_created
+{
+    my( $self, $path ) = @_;
+    my $notify = $self->_find_path( $path );
+    return unless $notify;
+    my $ch = bless { mask => IN_CREATE,
+                     cookie => 0,
+                     name => '',
+                     w => $notify->{watch}
+                   }, 'Linux::Inotify2::Event';
+    poe->kernel->post( $self->{alias}, 'inotify', [ $path ], [ $ch ] );
 }
 
 1;
@@ -444,7 +826,7 @@ file was moved to this object (directory)
 
 =item IN_CREATE
 
-file was created in this object (directory)
+file was created in this object (directory always, file in cooked mode)
 
 =item IN_DELETE
 
@@ -489,6 +871,7 @@ same as IN_MOVED_FROM | IN_MOVED_TO
 
 =back
 
+
 =over 4
 
 =item event
@@ -503,7 +886,41 @@ arguments are those specified by L</args>.
 
 An arrayref of arguments that will be passed to the event handler.
 
+=item events
+
+A hashref of mask=>event tupples.  You may use C<events> to register
+multiple callbacks at once. The keys are masks, the values are either a
+scalar (event in current session), arrayref (first element is an event, next
+elements are arguments) or hashref (with the keys C<event> and C<args>.
+
+And remember, C<=E<gt>> will turn a bare word into a string.  So use C<,> or
+C<()> to force the use of a constant.
+
+    { IN_CLOSE_WRITE => 'file_changed' }    # WRONG!
+    { IN_CLOSE_WRITE, 'file_changed' }      # OK
+    { IN_CLOSE_WRITE() => 'file_changed' }  # OK
+
+
+=item mode
+
+One of 2 strings: C<raw> or C<cooked>.  Raw mode requires that the monitored
+path exist prior to calling L</monitor>; if the path doesn't exist, an
+exception is thrown.
+
+Cooked mode, however, will wait for the path to be created and then start
+monitoring it.  It does this by checking the parent directories and
+monitoring the deepest one that exists.  And if the path is deleted then
+parent directories are monitored until the path is created again.
+
+Finaly, in cooked mode, C<IN_CREATE> events are generated for the path. 
+These are normaly never generated for files.  For directories, which normaly
+generate C<IN_CREATE> when a file is created, you may check C<name>; it will
+be C<''> for the directory creation event.
+
+The default is C<cooked>.
+
 =back
+
 
 
 =head3 Example
@@ -512,21 +929,55 @@ An arrayref of arguments that will be passed to the event handler.
 
     my $dir = '/var/ftp/incoming';
 
-    my $arg = {
-            path => $path
+    # Monitor a single event
+    my $M = {
+            path => $dir,
             mask => IN_DELETE|IN_CLOSE,
             event => 'uploaded',
             args  => [ $dir ]
         };
-    $poe_kernel->call( inotify => 'monitor', $arg );
+    $poe_kernel->call( inotify => 'monitor', $M );
 
     sub uploaded 
     {
-        my( $e, $path ) = @_[ARG0, ARG1];
-        warn $e->fullname, " was uploaded to $path";
+        my( $e, $dir ) = @_[ARG0, ARG1];
+        warn $e->fullname, " was uploaded to $dir";
+        .....
     }
 
+    # monitor multiple events
+    $M = {
+            path => $path
+            events => {
+                    (IN_MOVE_TO|IN_CLOSE_WRITE) => 'file_created',
+                    (IN_MOVE_FROM|IN_DELETE) => { event => 'file_deleted',
+                                                    args  => [ $one, $two ] },
+                    IN_CLOSE_NOWRITE, [ 'file_accessed', $path ]
+                }
+        };
+    $poe_kernel->call( inotify => 'monitor', $M );
+
+    sub file_created
+    {
+        my( $e ) = $_[ARG0];
+        .....
+    }
+
+    sub file_deleted
+    {
+        my( $e, $one, $two ) = $_[ARG0, ARG1, ARG2];
+        .....
+    }
+
+    sub file_accessed
+    {
+        my( $e, $path ) = $_[ARG0, ARG1];
+        .....
+    }
+
+
 =head2 unmonitor
+
 
     $poe_kernel->call( inotify => 'unmonitor', $arg );
 
@@ -542,8 +993,21 @@ The filesystem path to the directory to to stop monitoring.  Mandatory.
 
 =item event
 
-Name of the monitor event that was used in the original L</monitor> call.  Mandatory.
+Name of the monitor event that was used in the original L</monitor> call.
 You may use C<*> to unmonitor all events for the current session.
+
+=item events
+
+Use this to unregister multiple events at once.  This argument may be an
+arrayref of event names, or a hashref of mask=>event name tupples.
+
+    events => \@names,
+    events => { IN_CLOSE_WRITE() => 'event' }
+
+Note that the mask doesn't have to be an exact match to remove an event. For
+example, if you monitored C<IN_CLOSE>, which is
+C<IN_CLOSE_WRITEE<verbar>IN_CLOSE_NOWRITE>, but only use C<IN_CLOSE_NOWRITE>
+in your unmonitor call, it will still match and unmonitor C<IN_CLOSE>.
 
 =back
 
@@ -564,10 +1028,27 @@ to distinguish them.
 Shuts down the component gracefully. All monitored paths will be closed. Has
 no arguments.
 
+=head1 BUGS
+
+=over 4
+
+=item The fake C<IN_CREATE> events for cooked mode should be called C<IN_CREATE_SELF>.
+
+=back
+
+=head1 TODO
+
+=over 4
+
+=item Add a C<recursive> mode.  It would create monitors for all
+subdirectories of a path.
+
+=back
+
 
 =head1 SEE ALSO
 
-L<POE>, L<Linux::Inotify2>.
+L<Inotify|http://inotify.aiken.cz/>, L<POE>, L<Linux::Inotify2>.
 
 This module's API was heavily inspired by
 L<POE::Component::Win32::ChangeNotify>.

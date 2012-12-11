@@ -67,21 +67,14 @@ sub _start
 {
     my( $self ) = @_;
     DEBUG and diag( "_start $self" );
-    poe->kernel->post( $self->{notify},  monitor => { path  => $self->{dir},
-                                                      mask  => IN_ALL_EVENTS,
-                                                      event => 'notify_all',
-                                                      args  => $self->{dir}
-                                                    } );
-    poe->kernel->post( $self->{notify},  monitor => { path  => $self->{dir},
-                                                      mask  => IN_CLOSE,
-                                                      event => 'notify_create',
-                                                      args  => $self->{dir}
-                                                    } );
-    poe->kernel->post( $self->{notify},  monitor => { path  => $self->{dir}, 
-                                                      mask  => IN_CLOSE_WRITE,
-                                                      event => 'notify_change',
-                                                      args  => [ 42, $self->{dir} ]
-                                                    } );
+    my $M = { path  => $self->{dir},
+              mode  => 'cooked',
+              events => { IN_ALL_EVENTS, 'notify_all',
+                          IN_CLOSE, 'notify_create',
+                          IN_CLOSE_WRITE, 'notify_change'
+                        }
+            };
+    poe->kernel->post( $self->{notify},  monitor => $M );
     $self->{delay} = poe->kernel->delay_set( start => 2 );
 
 }
@@ -90,6 +83,8 @@ sub _stop
 {
     my( $self ) = @_;
     DEBUG and diag( "_stop $self" );
+
+    poe->kernel->call( $self->{notify}, 'shutdown' );
     if( $self->{file1} ) {
         remove_tree $self->{dir};
     }
@@ -114,19 +109,19 @@ sub start
 
 sub notify_create
 {
-    my( $self, $e, $path ) = @_;
+    my( $self, $e ) = @_;
     fail( "Never supposed to be called" );
 }
 
 sub notify_change
 {
-    my( $self, $e, $N, $path ) = @_;
+    my( $self, $e ) = @_;
     pass( "You called me!" );
 }
 
 sub notify_all
 {
-    my( $self, $e, $N, $path ) = @_;
+    my( $self, $e ) = @_;
     if( $e->IN_CLOSE_WRITE ) {
         pass( "notify_all" );
         $self->{delay} = poe->kernel->delay_set( done => 2 );
@@ -137,5 +132,5 @@ sub done
 {
     my( $self ) = @_;
     pass( "done" );
-    poe->kernel->post( $self->{notify} => 'shutdown' );
+    poe->kernel->call( $self->{notify}, unmonitor => { path=>$self->{dir}, event => '*' } );
 }

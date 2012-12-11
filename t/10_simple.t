@@ -3,10 +3,9 @@
 use strict;
 use warnings;
 
-BEGIN {
-    sub POE::Kernel::ASSERT_USAGE () { 1 }
-    sub POE::Kernel::TRACE_SIGNALS () { 0 }
-}
+sub POE::Kernel::ASSERT_USAGE () { 1 }
+sub POE::Kernel::TRACE_REFCNT () { 0 }
+
 
 use Data::Dumper;
 use POE;
@@ -66,7 +65,8 @@ sub _start
     DEBUG and diag( '_start' );
     poe->kernel->post( $self->{notify},  monitor => { path  => $self->{dir},
                                                       event => 'notify1',   
-                                                      args  => $self->{dir} 
+                                                      mode => 'raw',
+                                                      args  => $self->{dir}
                                                     } );
     $self->{delay} = poe->kernel->delay_set( start => 2 );
 }
@@ -102,6 +102,7 @@ sub notify1
     poe->kernel->call( $self->{notify}, monitor => { path => $self->{file1}, 
                                                      mask => IN_DELETE_SELF,
                                                      event => 'notify2',
+                                                     mode => 'raw',
                                                      args => $self->{file1} } );
     poe->kernel->call( $self->{notify}, unmonitor => { path => $self->{dir} } );
     $self->{delay} = poe->kernel->delay_set( next => 2 );
@@ -124,5 +125,5 @@ sub notify2
     is( $file, $self->{file1}, "Changed $self->{file1}" );
     is( $e->fullname, $file, " ... exactly" );
 
-    poe->kernel->call( $self->{notify}, 'shutdown' );
+    poe->kernel->post( $self->{notify}, 'shutdown' );
 }

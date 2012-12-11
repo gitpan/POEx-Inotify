@@ -1,5 +1,9 @@
 Revision history for Perl extension POEx::Inotify.
 
+0.0200  Tue Dec 11 2012
+    - Added mode=>'cooked'
+    - More doco
+
 0.0101  Mon Nov 26 2012
     - Forgot POE::Session::PlainCall prereq
 

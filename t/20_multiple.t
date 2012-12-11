@@ -66,16 +66,15 @@ sub _start
 {
     my( $self ) = @_;
     DEBUG and diag( "_start $self" );
-    poe->kernel->post( $self->{notify},  monitor => { path  => $self->{dir},
-                                                      mask  => IN_CLOSE,
-                                                      event => 'notify_create',
-                                                      args  => $self->{dir}
-                                                    } );
-    poe->kernel->post( $self->{notify},  monitor => { path  => $self->{dir}, 
-                                                      mask  => IN_DELETE,
-                                                      event => 'notify_del',
-                                                      args  => [ 42, $self->{dir} ]
-                                                    } );
+
+    my $M = { path  => $self->{dir},
+              events => { IN_CLOSE()  => [ 'notify_create', $self->{dir} ],
+                          IN_DELETE() => { event=>'notify_del', 
+                                           args => [ 42, $self->{dir} ]
+                                         }
+             } };
+
+    poe->kernel->post( $self->{notify},  monitor => $M );
     $self->{delay} = poe->kernel->delay_set( start => 2 );
 
 }
@@ -116,8 +115,8 @@ sub notify_del
     my( $self, $e, $N, $path ) = @_;
     is( $N, 42, "Args passed" );
     is( $path, $self->{dir}, "Change in $self->{dir}" );
-    is( $e->fullname, $self->{file1}, "Created $self->{file1}" );
-    ok( $e->IN_DELETE, " ... after closing" );
+    ok( $e->IN_DELETE, " ... deleted" );
+    is( $e->fullname, $self->{file1}, " ... $self->{file1}" );
     poe->kernel->call( $self->{notify}, 'shutdown' );
     return;
 }
