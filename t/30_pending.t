@@ -12,7 +12,7 @@ use Data::Dumper;
 use POE;
 use POEx::Inotify;
 use POE::Session::PlainCall;
-use Test::More ( tests => 14 );
+use Test::More ( tests => 20 );
 
 POEx::Inotify->spawn();
 pass( "built Inotify session" );
@@ -47,6 +47,7 @@ sub spawn
                     ctor_args => [ \%init ],
                     states    => [ qw( _start _stop 
                                     notify_create notify_delete
+                                    notify_create2 notify_delete2
                                     next done ) ]
                 );
 }
@@ -62,10 +63,12 @@ sub new
     $self->{sleep} = 2;
 
     $self->{want} = File::Spec->catfile( $self->{dir}, qw( one two three something.txt ) );
+    $self->{want2} = File::Spec->catfile( $self->{dir}, qw( one two three other.txt ) );
     $self->{todo} = [ qw( one/ one/two/ one/two/not.txt -one/two/ 
                           one/two/three/ one/two/three/something.txt
                           -one/two/
                           one/two/three/ one/two/three/something.txt
+                          one/two/three/other.txt
                           -one/ ) ];
 
     return $self;
@@ -91,6 +94,14 @@ sub _start
               mode  => 'cooked',
               events => { (IN_CREATE|IN_CLOSE_WRITE) => 'notify_create',
                           IN_DELETE_SELF() => [ 'notify_delete' ]
+                        }
+            };
+    poe->kernel->call( $self->{notify},  monitor => $M );
+
+    $M    = { path  => $self->{want2},
+              mode  => 'cooked',
+              events => { (IN_CREATE|IN_CLOSE_WRITE) => 'notify_create2',
+                          IN_DELETE_SELF() => [ 'notify_delete2' ]
                         }
             };
 
@@ -163,7 +174,11 @@ sub done
     my $M = { path  => $self->{want},
               events => [ qw( notify_create notify_delete ) ]
             };
+    poe->kernel->call( $self->{notify}, unmonitor => $M );
 
+    $M    = { path  => $self->{want2},
+              events => [ qw( notify_create2 notify_delete2 ) ]
+            };
     poe->kernel->call( $self->{notify}, unmonitor => $M );
 }
 
@@ -182,6 +197,25 @@ sub notify_delete
     my( $self, $e ) = @_;
     ok( $e->IN_DELETE_SELF, "Deleted" );
     like( $e->fullname, qr(something.txt$), " ... something.txt" );
+    is( $e->name, '' );
+    return;
+}
+
+#############################################
+sub notify_create2
+{
+    my( $self, $e ) = @_;
+    ok( $e->IN_CLOSE || $e->IN_CREATE, "Created" );
+    like( $e->fullname, qr(other.txt$), " ... other.txt" );
+    is( $e->name, '' );
+}
+
+#############################################
+sub notify_delete2
+{
+    my( $self, $e ) = @_;
+    ok( $e->IN_DELETE_SELF, "Deleted" );
+    like( $e->fullname, qr(other.txt$), " ... other.txt" );
     is( $e->name, '' );
     return;
 }

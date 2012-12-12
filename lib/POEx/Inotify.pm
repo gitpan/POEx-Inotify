@@ -6,7 +6,7 @@ use 5.008008;
 use strict;
 use warnings;
 
-our $VERSION = '0.0200';
+our $VERSION = '0.0201';
 $VERSION = eval $VERSION;  # see L<perlmodstyle>
 
 use POE;
@@ -76,7 +76,8 @@ sub _stop
 sub shutdown
 {
     my( $self ) = @_;
-    DEBUG and warn "$self->{alias}: shutdown";
+    DEBUG and 
+        warn "$self->{alias}: shutdown";
     $self->{shutdown} = 1;
     foreach my $path ( keys %{ $self->{path} } ) {
         local $self->{force} = 1;
@@ -259,11 +260,10 @@ sub _monitor_add
     confess "Why no calls? calls=", pp $calls unless $calls and 'ARRAY' eq ref $calls;
     $caller ||= '';
     if( !-e $path ) {
-        return if $mode =~ /^_/;
         if( $mode eq 'cooked' ) {
-            $self->_pending( $path, $calls );
-            return;
+            $self->_pending( $path, $calls ) and return 1;
         }
+        return;
     }
 
     my $notify = $self->_find_path( $path );
@@ -317,7 +317,10 @@ sub unmonitor
     $args->{session} = poe->sender;
     $args->{mask} = 0xFFFFFFFF unless defined $args->{mask};
     my $caller = join ' ', at => poe->caller_file,
-                               line => poe->caller_line;
+                               line => poe->caller_line . "\n";
+
+    DEBUG and 
+        warn "$self->{alias}: Unmonitor $path $caller";
 
     my $once = 0;
     my $notify = $self->_find_path( $path );
@@ -332,8 +335,8 @@ sub unmonitor
         $once++;
     }
 
-    unless( $once ) {
-        warn "$self->{alias}: $path wasn't monitored $caller\n";
+    unless( $once or $self->{shutdown} ) {
+        warn "$self->{alias}: $path wasn't monitored $caller";
     }
     return $once;
 }
@@ -359,7 +362,7 @@ sub _unmonitor_remove
     if( @calls > $ours ) {
         # If we have any non-internal calls, we keep the notify
         DEBUG and 
-            warn "$self->{alias}: still monitor $path ($notify)";
+            warn "$self->{alias}: still monitor $path";
         $notify->{call} = \@calls;
         if( @dec ) {
             # If we found a CB to remove, that means the mask might have changed
@@ -370,7 +373,7 @@ sub _unmonitor_remove
     else {
         # No external calls so we can drop this notify
         DEBUG and 
-            warn "$self->{alias}: unmonitor $path ($notify)";
+            warn "$self->{alias}: unmonitor $path";
         $notify->{watch}->cancel; 
         delete $notify->{watch};
         DEBUG2 and warn "$self->{alias}: REFCNT MINUS ", poe->session->ID, " (me) $path";
@@ -448,7 +451,7 @@ sub _pending
     if( $P and $P->{monitored} ) {
         DEBUG and warn "$self->{alias}: pending $path more";
         push @{ $P->{call} }, @$calls if $calls;
-        return;
+        return 1;
     }
 
     my @todo = File::Spec->splitdir( $path );
@@ -465,7 +468,7 @@ sub _pending
             }
         }
     }
-    $self->_pending_monitor( $path, File::Spec->rootdir, @todo, $calls );
+    return $self->_pending_monitor( $path, File::Spec->rootdir, @todo, $calls );
 }
 
 #############################################
@@ -489,7 +492,10 @@ sub _pending_remove
         # No external calls so we can drop this notify
         DEBUG and 
             warn "$self->{alias}: unpending $path ($P)";
-        $self->_pending_unmonitor( $path, $P->{exists} );
+        unless( $self->_pending_N( $path, $P->{exists} ) ) {
+            $self->_pending_unmonitor( $path, $P->{exists} );
+        }
+           
         delete $self->{pending}{ $path };
         $finished = 1;
     }
@@ -501,9 +507,11 @@ sub _pending_remove
 sub _pending_monitor
 {
     my( $self, $path, $exists, $want ) = @_;
-    DEBUG and warn "$self->{alias}: pending $path pending on $exists";
+    DEBUG and 
+        warn "$self->{alias}: pending monitor $exists";
 
-    $self->{pending}{ $path } ||= { call=>[], exists=>$exists };
+    $self->{pending}{ $path } ||= { call=>[] };
+    $self->{pending}{ $path }{exists} = $exists;
 
     my $M = { path => $exists,
               mode => '_pending',
@@ -525,6 +533,8 @@ sub _pending_unmonitor
 
     my $P = $self->_find_pending( $path );
     return unless $P and $P->{monitored};
+    DEBUG and 
+        warn "$self->{alias}: pending unmonitor $exists";
     poe->kernel->call( $self->{alias}, 'unmonitor', 
                             {   path=>$exists,  
                                 events => [ qw( __pending_deleted __pending_created ) ]
@@ -539,6 +549,16 @@ sub _find_pending
     return $self->{pending}{ $path };
 }
 
+sub _pending_N
+{
+    my( $self, $path, $exists ) = @_;
+    foreach my $kpath ( keys %{ $self->{pending} } ) {
+        next if $kpath eq $path;
+        return 1 if $self->{pending}{ $kpath }{exists} eq $exists;
+    }    
+    return 0;
+}
+
 #############################################
 sub __pending_deleted
 {
@@ -547,8 +567,14 @@ sub __pending_deleted
     my $P = $self->_find_pending( $path );
     return unless $P;
 
-    DEBUG and warn "$self->{alias}: pending $path deleted $exists";
-    $self->_pending_unmonitor( $path, $exists );
+    DEBUG and 
+        warn "$self->{alias}: pending deleted $exists";
+    unless( $self->_pending_N( $path, $exists ) ) {
+        $self->_pending_unmonitor( $path, $exists );
+    }
+    else {
+        $P->{monitored} = 0;
+    }
     $self->_pending( $path );
 }
 
@@ -562,16 +588,20 @@ sub __pending_created
     return unless $P;
 
     DEBUG and warn "$self->{alias}: pending $path created ", $ch->name;
-    $self->_pending_unmonitor( $path, $exists );
-    if( -e $path ) {
-        delete $self->{pending}{ $path };
-        $self->_monitor_add( $path, 'cooked', $P->{call} );
-        $self->_fake_created( $path );
+    unless( $self->_pending_N( $path, $exists ) ) {
+        $self->_pending_unmonitor( $path, $exists );
     }
     else {
-        $self->_pending( $path );
+        $P->{monitored} = 0;
+    }
+    delete $self->{pending}{ $path };
+    if( $self->_monitor_add( $path, 'cooked', $P->{call} ) ) {
+        $self->_fake_created( $path );
     }
 }
+
+
+
 
 
 #####################################################################
@@ -635,6 +665,9 @@ sub _self_unmonitor
     delete $self->{self}{ $path };
     # we are called from ->unmonitor which has already cleared {path}
     # and the Inotify2 object, so we don't have to do anything more
+
+    # But if we do add an 'unmonitor' call here, then we must add a _self_N
+    # to make sure we only unmonitor when no one is interested
 }
 
 #############################################

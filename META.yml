@@ -24,4 +24,4 @@ requires:
   Linux::Inotify2: 1
   POE: 1.284
   POE::Session::PlainCall: 0.03
-version: 0.0200
+version: 0.0201
